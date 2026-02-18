@@ -1,0 +1,175 @@
+import requests
+import time
+import json
+from datetime import datetime, timezone
+from dateutil import parser, tz
+
+ET = tz.gettz('America/New_York')
+UTC = timezone.utc
+
+# ANSI colors
+GREEN = "\033[92m"
+RED   = "\033[91m"
+RESET = "\033[0m"
+
+last_up_prob = None
+
+
+def get_midpoint(token_id):
+    url = "https://clob.polymarket.com/midpoint"
+    try:
+        r = requests.get(url, params={"token_id": token_id}, timeout=8)
+        r.raise_for_status()
+        mid = r.json().get("mid")
+        return float(mid) if mid is not None else None
+    except Exception as e:
+        print(f"  Midpoint error {token_id}: {e}")
+        return None
+
+
+def get_btc_spot():
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
+            timeout=6
+        )
+        return r.json()["bitcoin"]["usd"]
+    except:
+        return None
+
+
+def get_current_btc_5min_market():
+    now_utc = datetime.now(UTC)
+    unix_now = int(now_utc.timestamp())
+    five_min = 5 * 60
+    start_unix_current = (unix_now // five_min) * five_min
+
+    candidates = [
+        start_unix_current,
+        start_unix_current - five_min,
+        start_unix_current + five_min,
+    ]
+
+    best_market = None
+    best_title = None
+    best_score = -999999
+
+    now_et = now_utc.astimezone(ET)
+
+    for ts in candidates:
+        slug = f"btc-updown-5m-{ts}"
+        try:
+            r = requests.get(f"https://gamma-api.polymarket.com/events/slug/{slug}", timeout=10)
+            r.raise_for_status()
+            event = r.json()
+            markets = event.get("markets", [])
+            if len(markets) != 1:
+                continue
+
+            market = markets[0]
+            start_str = market.get("startDate") or ""
+            end_str   = market.get("endDate") or ""
+            if not (start_str and end_str):
+                continue
+
+            start_dt = parser.parse(start_str).astimezone(ET)
+            end_dt   = parser.parse(end_str).astimezone(ET)
+
+            if start_dt <= now_et <= end_dt:
+                score = 10000.0
+            elif now_et < start_dt:
+                score = - (start_dt - now_et).total_seconds()
+            else:
+                score = - (now_et - end_dt).total_seconds()
+
+            if score > best_score:
+                best_score = score
+                best_market = market
+                best_title  = event.get('title', f"btc-updown-5m-{ts}")
+
+        except Exception:
+            continue
+
+    return best_market, best_title
+
+
+while True:
+    market, title = get_current_btc_5min_market()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    btc_price = get_btc_spot()
+
+    if market:
+        end_iso = market.get("endDate")
+        end_part = ""
+        if end_iso:
+            try:
+                end_et = parser.parse(end_iso).astimezone(ET)
+                # 12-hour format with AM/PM
+                end_part = f" → ends at {end_et.strftime('%I:%M %p ET')}"
+            except:
+                pass
+
+        print(f"\n[{now_str}]  {title}{end_part}")
+        if btc_price:
+            print(f"  Current BTC spot: ${btc_price:,.0f}")
+
+        outcomes_raw = market.get("outcomes", "[]")
+        token_ids_raw = market.get("clobTokenIds", "[]")
+
+        try:
+            outcomes = json.loads(outcomes_raw)
+            token_ids = json.loads(token_ids_raw)
+        except:
+            print("  JSON parse failed")
+            time.sleep(15)
+            continue
+
+        if len(outcomes) != 2 or len(token_ids) != 2:
+            print(f"  Bad structure ({len(outcomes)} outcomes)")
+            time.sleep(15)
+            continue
+
+        prices = {}
+        for i, outcome in enumerate(outcomes):
+            label = outcome.strip()
+            price = get_midpoint(token_ids[i].strip())
+            if price is not None:
+                prices[label] = price
+                pct = price * 100
+                print(f"      {label:>6}: {price:.4f}   ({pct:5.1f}%)")
+
+        if "Up" in prices:
+            up_prob = prices["Up"] * 100
+            delta = ""
+            if last_up_prob is not None:
+                diff = up_prob - last_up_prob
+                if abs(diff) > 0.1:
+                    arrow = "↑" if diff > 0 else "↓"
+                    delta = f"  ({arrow} {abs(diff):.1f}%)"
+            last_up_prob = up_prob
+
+            if up_prob > 65:
+                color = GREEN
+                text = "STRONG UP bias — market expects meaningful rise"
+            elif up_prob > 55:
+                color = GREEN
+                text = "Mild UP bias"
+            elif up_prob > 45:
+                color = ""
+                text = "Neutral / coin-flip territory"
+            elif up_prob > 35:
+                color = RED
+                text = "Mild DOWN bias"
+            else:
+                color = RED
+                text = "STRONG DOWN bias — market expects meaningful drop"
+
+            print(f"{color}  Current reco: {text}{delta}{RESET}")
+
+    else:
+        print(f"[{now_str}]  No active 5-min BTC Up/Down market detected")
+        last_up_prob = None
+
+    print("Sleeping 15s...\n")
+    time.sleep(15)
